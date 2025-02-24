@@ -17,18 +17,20 @@
 
 package kafka.server.metadata
 
-import java.util.{OptionalInt, Properties}
+import java.util.OptionalInt
 import kafka.coordinator.transaction.TransactionCoordinator
 import kafka.log.LogManager
-import kafka.server.{KafkaConfig, ReplicaManager, RequestLocal}
+import kafka.server.{KafkaConfig, ReplicaManager}
 import kafka.utils.Logging
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupCoordinator
+import org.apache.kafka.coordinator.share.ShareCoordinator
 import org.apache.kafka.image.loader.LoaderManifest
 import org.apache.kafka.image.publisher.MetadataPublisher
 import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicDelta}
+import org.apache.kafka.server.common.RequestLocal
 import org.apache.kafka.server.fault.FaultHandler
 
 import java.util.concurrent.CompletableFuture
@@ -66,8 +68,10 @@ class BrokerMetadataPublisher(
   replicaManager: ReplicaManager,
   groupCoordinator: GroupCoordinator,
   txnCoordinator: TransactionCoordinator,
+  shareCoordinator: Option[ShareCoordinator],
   var dynamicConfigPublisher: DynamicConfigPublisher,
   dynamicClientQuotaPublisher: DynamicClientQuotaPublisher,
+  dynamicTopicClusterQuotaPublisher: DynamicTopicClusterQuotaPublisher,
   scramPublisher: ScramPublisher,
   delegationTokenPublisher: DelegationTokenPublisher,
   aclPublisher: AclPublisher,
@@ -115,7 +119,7 @@ class BrokerMetadataPublisher(
       // Publish the new metadata image to the metadata cache.
       metadataCache.setImage(newImage)
 
-      val metadataVersionLogMsg = s"metadata.version ${newImage.features().metadataVersion()}"
+      def metadataVersionLogMsg = s"metadata.version ${newImage.features().metadataVersion()}"
 
       if (_firstPublish) {
         info(s"Publishing initial metadata at offset $highestOffsetAndEpoch with $metadataVersionLogMsg.")
@@ -159,6 +163,19 @@ class BrokerMetadataPublisher(
           case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating txn " +
             s"coordinator with local changes in $deltaName", t)
         }
+        if (shareCoordinator.isDefined) {
+          try {
+            updateCoordinator(newImage,
+              delta,
+              Topic.SHARE_GROUP_STATE_TOPIC_NAME,
+              shareCoordinator.get.onElection,
+              (partitionIndex, leaderEpochOpt) => shareCoordinator.get.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))
+            )
+          } catch {
+            case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
+              s"coordinator with local changes in $deltaName", t)
+          }
+        }
         try {
           // Notify the group coordinator about deleted topics.
           val deletedTopicPartitions = new mutable.ArrayBuffer[TopicPartition]()
@@ -169,7 +186,7 @@ class BrokerMetadataPublisher(
             }
           }
           if (deletedTopicPartitions.nonEmpty) {
-            groupCoordinator.onPartitionsDeleted(deletedTopicPartitions.asJava, RequestLocal.NoCaching.bufferSupplier)
+            groupCoordinator.onPartitionsDeleted(deletedTopicPartitions.asJava, RequestLocal.noCaching.bufferSupplier)
           }
         } catch {
           case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating group " +
@@ -182,6 +199,9 @@ class BrokerMetadataPublisher(
 
       // Apply client quotas delta.
       dynamicClientQuotaPublisher.onMetadataUpdate(delta, newImage)
+
+      // Apply topic or cluster quotas delta.
+      dynamicTopicClusterQuotaPublisher.onMetadataUpdate(delta, newImage)
 
       // Apply SCRAM delta.
       scramPublisher.onMetadataUpdate(delta, newImage)
@@ -197,6 +217,14 @@ class BrokerMetadataPublisher(
         groupCoordinator.onNewMetadataImage(newImage, delta)
       } catch {
         case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating group " +
+          s"coordinator with local changes in $deltaName", t)
+      }
+
+      try {
+        // Propagate the new image to the share coordinator.
+        shareCoordinator.foreach(coordinator => coordinator.onNewMetadataImage(newImage, delta))
+      } catch {
+        case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
           s"coordinator with local changes in $deltaName", t)
       }
 
@@ -217,10 +245,6 @@ class BrokerMetadataPublisher(
       case Some(leaderEpoch) => OptionalInt.of(leaderEpoch)
       case None => OptionalInt.empty
     }
-  }
-
-  def reloadUpdatedFilesWithoutConfigChange(props: Properties): Unit = {
-    config.dynamicConfig.reloadUpdatedFilesWithoutConfigChange(props)
   }
 
   /**
@@ -308,9 +332,18 @@ class BrokerMetadataPublisher(
     try {
       // Start the transaction coordinator.
       txnCoordinator.startup(() => metadataCache.numPartitions(
-        Topic.TRANSACTION_STATE_TOPIC_NAME).getOrElse(config.transactionTopicPartitions))
+        Topic.TRANSACTION_STATE_TOPIC_NAME).getOrElse(config.transactionLogConfig.transactionTopicPartitions))
     } catch {
       case t: Throwable => fatalFaultHandler.handleFault("Error starting TransactionCoordinator", t)
+    }
+    if (config.shareGroupConfig.isShareGroupEnabled && shareCoordinator.isDefined) {
+      try {
+        // Start the share coordinator.
+        shareCoordinator.get.startup(() => metadataCache.numPartitions(
+          Topic.SHARE_GROUP_STATE_TOPIC_NAME).getOrElse(config.shareCoordinatorConfig.shareCoordinatorStateTopicNumPartitions()))
+      } catch {
+        case t: Throwable => fatalFaultHandler.handleFault("Error starting Share coordinator", t)
+      }
     }
   }
 

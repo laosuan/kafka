@@ -19,9 +19,11 @@ package org.apache.kafka.controller;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.errors.BrokerIdNotRegisteredException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.message.AllocateProducerIdsRequestData;
 import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData;
 import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData.ReassignableTopic;
@@ -58,8 +60,6 @@ import org.apache.kafka.common.metadata.RegisterBrokerRecord.BrokerEndpoint;
 import org.apache.kafka.common.metadata.RegisterBrokerRecord.BrokerEndpointCollection;
 import org.apache.kafka.common.metadata.RegisterControllerRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
-import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
-import org.apache.kafka.common.metadata.ZkMigrationStateRecord;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.AlterPartitionRequest;
@@ -98,34 +98,31 @@ import org.apache.kafka.metadata.RecordTestUtils.ImageDeltaPair;
 import org.apache.kafka.metadata.RecordTestUtils.TestThroughAllIntermediateImagesLeadingToFinalImageHelper;
 import org.apache.kafka.metadata.authorizer.StandardAuthorizer;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
-import org.apache.kafka.metadata.migration.ZkMigrationState;
-import org.apache.kafka.metadata.migration.ZkRecordConsumer;
 import org.apache.kafka.metadata.util.BatchFileWriter;
 import org.apache.kafka.metalog.LocalLogManager;
 import org.apache.kafka.metalog.LocalLogManagerTestEnv;
 import org.apache.kafka.raft.Batch;
 import org.apache.kafka.raft.OffsetAndEpoch;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
+import org.apache.kafka.server.common.Feature;
+import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.common.TopicIdPartition;
-import org.apache.kafka.server.fault.FaultHandlerException;
 import org.apache.kafka.snapshot.FileRawSnapshotReader;
 import org.apache.kafka.snapshot.Snapshots;
 import org.apache.kafka.test.TestUtils;
 import org.apache.kafka.timeline.SnapshotRegistry;
 
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -155,12 +152,12 @@ import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.SET;
 import static org.apache.kafka.common.config.ConfigResource.Type.BROKER;
 import static org.apache.kafka.common.config.ConfigResource.Type.TOPIC;
 import static org.apache.kafka.controller.ConfigurationControlManagerTest.BROKER0;
-import static org.apache.kafka.controller.ConfigurationControlManagerTest.SCHEMA;
 import static org.apache.kafka.controller.ConfigurationControlManagerTest.entry;
+import static org.apache.kafka.controller.ConfigurationControlManagerTest.toMap;
 import static org.apache.kafka.controller.ControllerRequestContextUtil.ANONYMOUS_CONTEXT;
 import static org.apache.kafka.controller.ControllerRequestContextUtil.anonymousContextFor;
 import static org.apache.kafka.controller.QuorumControllerIntegrationTestUtils.brokerFeatures;
-import static org.apache.kafka.controller.QuorumControllerIntegrationTestUtils.forceRenounce;
+import static org.apache.kafka.controller.QuorumControllerIntegrationTestUtils.brokerFeaturesPlusFeatureVersions;
 import static org.apache.kafka.controller.QuorumControllerIntegrationTestUtils.pause;
 import static org.apache.kafka.controller.QuorumControllerIntegrationTestUtils.registerBrokersAndUnfence;
 import static org.apache.kafka.controller.QuorumControllerIntegrationTestUtils.sendBrokerHeartbeatToUnfenceBrokers;
@@ -169,7 +166,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -190,14 +186,12 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 build()
         ) {
             controlEnv.activeController().registerBroker(ANONYMOUS_CONTEXT,
                 new BrokerRegistrationRequestData().
-                setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.latestTesting())).
+                setFeatures(brokerFeaturesPlusFeatureVersions(MetadataVersion.MINIMUM_VERSION, MetadataVersion.latestTesting(),
+                    Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_1.featureLevel()))).
                 setBrokerId(0).
                 setLogDirs(Collections.singletonList(Uuid.fromString("iiaQjkRPQcuMULNII0MUeA"))).
                 setClusterId(logEnv.clusterId())).get();
@@ -234,14 +228,12 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 build()
         ) {
             controlEnv.activeController().registerBroker(ANONYMOUS_CONTEXT,
                 new BrokerRegistrationRequestData().
-                    setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.latestTesting())).
+                    setFeatures(brokerFeaturesPlusFeatureVersions(MetadataVersion.MINIMUM_VERSION, MetadataVersion.latestTesting(),
+                        Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_1.featureLevel()))).
                     setBrokerId(0).
                     setLogDirs(Collections.singletonList(Uuid.fromString("sTbzRAMnTpahIyIPNjiLhw"))).
                     setClusterId(logEnv.clusterId())).get();
@@ -264,7 +256,7 @@ public class QuorumControllerTest {
             new ResultOrError<>(Collections.emptyMap())),
             controller.describeConfigs(ANONYMOUS_CONTEXT, Collections.singletonMap(
                 BROKER0, Collections.emptyList())).get());
-        logEnv.logManagers().forEach(m -> m.setMaxReadOffset(6L));
+        logEnv.logManagers().forEach(m -> m.setMaxReadOffset(8L));
         assertEquals(Collections.singletonMap(BROKER0, ApiError.NONE), future1.get());
     }
 
@@ -281,9 +273,6 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
                 setBootstrapMetadata(SIMPLE_BOOTSTRAP).
                 build()
@@ -299,7 +288,7 @@ public class QuorumControllerTest {
                     new BrokerRegistrationRequestData().
                         setBrokerId(brokerId).
                         setClusterId(active.clusterId()).
-                        setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.latestTesting())).
+                        setFeatures(brokerFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.latestTesting())).
                         setIncarnationId(Uuid.randomUuid()).
                         setListeners(listeners));
                 brokerEpochs.put(brokerId, reply.get().epoch());
@@ -364,7 +353,33 @@ public class QuorumControllerTest {
     }
 
     @Test
-    public void testUncleanShutdownBroker() throws Throwable {
+    public  void testElrEnabledByDefault() throws Throwable {
+        long sessionTimeoutMillis = 500;
+        try (
+            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
+                build();
+            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
+                setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
+                setBootstrapMetadata(BootstrapMetadata.fromRecords(
+                    Arrays.asList(
+                        new ApiMessageAndVersion(new FeatureLevelRecord().
+                            setName(MetadataVersion.FEATURE_NAME).
+                            setFeatureLevel(MetadataVersion.IBP_4_0_IV1.featureLevel()), (short) 0),
+                        new ApiMessageAndVersion(new FeatureLevelRecord().
+                            setName(EligibleLeaderReplicasVersion.FEATURE_NAME).
+                            setFeatureLevel(EligibleLeaderReplicasVersion.ELRV_1.featureLevel()), (short) 0)
+                    ),
+                    "test-provided bootstrap ELR enabled"
+                )).
+                build()
+        ) {
+            controlEnv.activeController(true);
+            assertTrue(controlEnv.activeController().configurationControl().clusterConfig().containsKey(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG));
+        }
+    }
+
+    @Test
+    public void testUncleanShutdownBrokerElrEnabled() throws Throwable {
         List<Integer> allBrokers = Arrays.asList(1, 2, 3);
         short replicationFactor = (short) allBrokers.size();
         long sessionTimeoutMillis = 500;
@@ -373,26 +388,24 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
-
-                setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV0, "test-provided bootstrap ELR enabled")).
+                setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV1, "test-provided bootstrap ELR enabled")).
                 build()
         ) {
             ListenerCollection listeners = new ListenerCollection();
             listeners.add(new Listener().setName("PLAINTEXT").setHost("localhost").setPort(9092));
             QuorumController active = controlEnv.activeController();
             Map<Integer, Long> brokerEpochs = new HashMap<>();
-
+            BrokerRegistrationRequestData.FeatureCollection features =
+                brokerFeaturesPlusFeatureVersions(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_4_0_IV1,
+                    Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_1.featureLevel()));
             for (Integer brokerId : allBrokers) {
                 CompletableFuture<BrokerRegistrationReply> reply = active.registerBroker(
                     anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
                     new BrokerRegistrationRequestData().
                         setBrokerId(brokerId).
                         setClusterId(active.clusterId()).
-                        setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_4_0_IV0)).
+                        setFeatures(features).
                         setIncarnationId(Uuid.randomUuid()).
                         setLogDirs(Collections.singletonList(Uuid.randomUuid())).
                         setListeners(listeners));
@@ -446,39 +459,40 @@ public class QuorumControllerTest {
             int brokerToUncleanShutdown, brokerToBeTheLeader;
 
             // lastKnownElr stores the last known leader.
+            brokerToUncleanShutdown = lastKnownElr[0];
             if (lastKnownElr[0] == partition.elr[0]) {
-                brokerToUncleanShutdown = partition.elr[0];
                 brokerToBeTheLeader = partition.elr[1];
             } else {
-                brokerToUncleanShutdown = partition.elr[1];
                 brokerToBeTheLeader = partition.elr[0];
             }
 
-            // Unclean shutdown should remove the ELR members.
-            active.registerBroker(
+            // Unclean shutdown should remove brokerToUncleanShutdown from the ELR members, but it should still be in
+            // the lastKnownElr.
+            CompletableFuture<BrokerRegistrationReply> reply = active.registerBroker(
                 anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
                 new BrokerRegistrationRequestData().
                     setBrokerId(brokerToUncleanShutdown).
                     setClusterId(active.clusterId()).
-                    setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_4_0_IV0)).
+                    setFeatures(features).
                     setIncarnationId(Uuid.randomUuid()).
                     setLogDirs(Collections.singletonList(Uuid.randomUuid())).
-                    setListeners(listeners)).get();
+                    setListeners(listeners));
+            brokerEpochs.put(brokerToUncleanShutdown, reply.get().epoch());
             partition = active.replicationControl().getPartition(topicIdFoo, 0);
             assertArrayEquals(new int[]{brokerToBeTheLeader}, partition.elr, partition.toString());
+            assertArrayEquals(lastKnownElr, partition.lastKnownElr, partition.toString());
 
             // Unclean shutdown should not remove the last known ELR members.
             active.registerBroker(
                 anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
                 new BrokerRegistrationRequestData().
-                    setBrokerId(lastKnownElr[0]).
+                    setBrokerId(brokerToBeTheLeader).
                     setClusterId(active.clusterId()).
-                    setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_4_0_IV0)).
+                    setFeatures(features).
                     setIncarnationId(Uuid.randomUuid()).
+                    setPreviousBrokerEpoch(brokerEpochs.get(brokerToBeTheLeader)).
                     setLogDirs(Collections.singletonList(Uuid.randomUuid())).
-                    setListeners(listeners)).get();
-            partition = active.replicationControl().getPartition(topicIdFoo, 0);
-            assertArrayEquals(lastKnownElr, partition.lastKnownElr, partition.toString());
+                    setListeners(listeners));
 
             // Unfence the last one in the ELR, it should be elected.
             sendBrokerHeartbeatToUnfenceBrokers(active, singletonList(brokerToBeTheLeader), brokerEpochs);
@@ -491,6 +505,227 @@ public class QuorumControllerTest {
             assertEquals(0, partition.elr.length, partition.toString());
             assertEquals(0, partition.lastKnownElr.length, partition.toString());
             assertEquals(brokerToBeTheLeader, partition.leader, partition.toString());
+        }
+    }
+
+    @Test
+    public void testUncleanShutdownElrDisabled() throws Exception {
+        List<Integer> allBrokers = Arrays.asList(1, 2, 3);
+        short replicationFactor = (short) allBrokers.size();
+        long sessionTimeoutMillis = 500;
+
+        try (
+            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
+                build();
+            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv)
+                .setControllerBuilderInitializer(controllerBuilder ->
+                    controllerBuilder.setFenceStaleBrokerIntervalNs(TimeUnit.SECONDS.toNanos(15)))
+                .setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis))
+                .setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV0, "test-provided bootstrap ELR not supported"))
+                .build()
+        ) {
+            ListenerCollection listeners = new ListenerCollection();
+            listeners.add(new Listener().setName("PLAINTEXT").setHost("localhost").setPort(9092));
+            QuorumController active = controlEnv.activeController();
+            Map<Integer, Long> brokerEpochs = new HashMap<>();
+            BrokerRegistrationRequestData.FeatureCollection features =
+                brokerFeaturesPlusFeatureVersions(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_4_0_IV0,
+                    Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_0.featureLevel()));
+            for (Integer brokerId : allBrokers) {
+                CompletableFuture<BrokerRegistrationReply> reply = active.registerBroker(
+                    anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
+                    new BrokerRegistrationRequestData().
+                        setBrokerId(brokerId).
+                        setClusterId(active.clusterId()).
+                        setFeatures(features).
+                        setIncarnationId(Uuid.randomUuid()).
+                        setLogDirs(Collections.singletonList(Uuid.randomUuid())).
+                        setListeners(listeners));
+                brokerEpochs.put(brokerId, reply.get().epoch());
+            }
+
+            // Brokers are only registered and should still be fenced
+            allBrokers.forEach(brokerId ->
+                assertFalse(active.clusterControl().isUnfenced(brokerId), "Broker " + brokerId + " should have been fenced")
+            );
+
+            // Unfence all brokers and create a topic foo
+            sendBrokerHeartbeatToUnfenceBrokers(active, allBrokers, brokerEpochs);
+            CreateTopicsRequestData createTopicsRequestData = new CreateTopicsRequestData().setTopics(
+                new CreatableTopicCollection(Collections.singleton(
+                    new CreatableTopic().setName("foo").setNumPartitions(1).
+                        setReplicationFactor(replicationFactor)).iterator()));
+            CreateTopicsResponseData createTopicsResponseData = active.createTopics(
+                ANONYMOUS_CONTEXT, createTopicsRequestData,
+                Collections.singleton("foo")).get();
+            assertEquals(Errors.NONE, Errors.forCode(createTopicsResponseData.topics().find("foo").errorCode()));
+            Uuid topicIdFoo = createTopicsResponseData.topics().find("foo").topicId();
+
+            // wait for brokers to become inactive
+            active.time().sleep(sessionTimeoutMillis);
+
+            // unclean shutdown for each replica
+            for (int i = 0; i < (int) replicationFactor; i++) {
+                // Verify that ELR is disabled
+                PartitionRegistration partition = active.replicationControl().getPartition(topicIdFoo, 0);
+                assertEquals(0, partition.elr.length, partition.toString());
+                assertEquals(0, partition.lastKnownElr.length, partition.toString());
+
+                boolean lastStandingIsr = i == (replicationFactor - 1);
+                int prevLeader = partition.leader;
+                int prevLeaderEpoch = partition.leaderEpoch;
+                // Unclean shutdown should remove the broker from the ISR and reassign leadership
+                active.registerBroker(
+                    anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
+                    new BrokerRegistrationRequestData().
+                        setBrokerId(prevLeader).
+                        setClusterId(active.clusterId()).
+                        setFeatures(features).
+                        setIncarnationId(Uuid.randomUuid()).
+                        setLogDirs(Collections.singletonList(Uuid.randomUuid())).
+                        setListeners(listeners)).get();
+                partition = active.replicationControl().getPartition(topicIdFoo, 0);
+                // leader should always change, leader epoch should always be incremented
+                int currentLeader = partition.leader;
+                int currentLeaderEpoch = partition.leaderEpoch;
+                assertNotEquals(currentLeader, prevLeader);
+                assertNotEquals(currentLeaderEpoch, prevLeaderEpoch);
+                // if the broker is not the last standing ISR, it should be removed from the ISR
+                if (lastStandingIsr) {
+                    assertArrayEquals(new int[]{prevLeader}, partition.isr);
+                    assertEquals(NO_LEADER, currentLeader);
+                } else {
+                    List<Integer> isr = Arrays.stream(partition.isr).boxed().toList();
+                    assertFalse(isr.contains(prevLeader));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testMinIsrUpdateWithElr() throws Throwable {
+        List<Integer> allBrokers = Arrays.asList(1, 2, 3);
+        List<Integer> brokersToKeepUnfenced = Arrays.asList(1);
+        List<Integer> brokersToFence = Arrays.asList(2, 3);
+        short replicationFactor = (short) allBrokers.size();
+        long sessionTimeoutMillis = 300;
+
+        try (
+            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).build();
+            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
+                setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
+                setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV1, "test-provided bootstrap ELR enabled")).
+                build()
+        ) {
+            ListenerCollection listeners = new ListenerCollection();
+            listeners.add(new Listener().setName("PLAINTEXT").setHost("localhost").setPort(9092));
+            QuorumController active = controlEnv.activeController();
+            Map<Integer, Long> brokerEpochs = new HashMap<>();
+
+            for (Integer brokerId : allBrokers) {
+                CompletableFuture<BrokerRegistrationReply> reply = active.registerBroker(
+                    anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
+                    new BrokerRegistrationRequestData().
+                        setBrokerId(brokerId).
+                        setClusterId(active.clusterId()).
+                        setFeatures(brokerFeaturesPlusFeatureVersions(MetadataVersion.MINIMUM_VERSION, MetadataVersion.latestTesting(),
+                            Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_1.featureLevel()))).
+                        setIncarnationId(Uuid.randomUuid()).
+                        setLogDirs(Collections.singletonList(Uuid.randomUuid())).
+                        setListeners(listeners));
+                brokerEpochs.put(brokerId, reply.get().epoch());
+            }
+
+            // Brokers are only registered and should still be fenced
+            allBrokers.forEach(brokerId -> {
+                assertFalse(active.clusterControl().isUnfenced(brokerId),
+                    "Broker " + brokerId + " should have been fenced");
+            });
+
+            // Unfence all brokers and create a topic foo (min ISR 2)
+            sendBrokerHeartbeatToUnfenceBrokers(active, allBrokers, brokerEpochs);
+            CreateTopicsRequestData createTopicsRequestData = new CreateTopicsRequestData().setTopics(
+                new CreatableTopicCollection(Arrays.asList(
+                    new CreatableTopic().setName("foo").setNumPartitions(1).
+                        setReplicationFactor(replicationFactor),
+                    new CreatableTopic().setName("bar").setNumPartitions(1).
+                        setReplicationFactor(replicationFactor)
+                ).iterator()));
+            CreateTopicsResponseData createTopicsResponseData = active.createTopics(
+                ANONYMOUS_CONTEXT, createTopicsRequestData,
+                new HashSet<>(Arrays.asList("foo", "bar"))).get();
+            assertEquals(Errors.NONE, Errors.forCode(createTopicsResponseData.topics().find("foo").errorCode()));
+            assertEquals(Errors.NONE, Errors.forCode(createTopicsResponseData.topics().find("bar").errorCode()));
+            Uuid topicIdFoo = createTopicsResponseData.topics().find("foo").topicId();
+            Uuid topicIdBar = createTopicsResponseData.topics().find("bar").topicId();
+            ConfigRecord configRecord = new ConfigRecord()
+                .setResourceType(BROKER.id())
+                .setResourceName("")
+                .setName(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG)
+                .setValue("2");
+            RecordTestUtils.replayAll(active.configurationControl(), singletonList(new ApiMessageAndVersion(configRecord, (short) 0)));
+
+            // Fence brokers
+            TestUtils.waitForCondition(() -> {
+                    sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
+                    for (Integer brokerId : brokersToFence) {
+                        if (active.clusterControl().isUnfenced(brokerId)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }, sessionTimeoutMillis * 30,
+                "Fencing of brokers did not process within expected time"
+            );
+
+            // Send another heartbeat to the brokers we want to keep alive
+            sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
+
+            // At this point only the brokers we want to fence (broker 2, 3) should be fenced.
+            brokersToKeepUnfenced.forEach(brokerId -> {
+                assertTrue(active.clusterControl().isUnfenced(brokerId),
+                    "Broker " + brokerId + " should have been unfenced");
+            });
+            brokersToFence.forEach(brokerId -> {
+                assertFalse(active.clusterControl().isUnfenced(brokerId),
+                    "Broker " + brokerId + " should have been fenced");
+            });
+            sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
+
+            // Verify the isr and elr for the topic partition
+            PartitionRegistration partition = active.replicationControl().getPartition(topicIdFoo, 0);
+            assertArrayEquals(new int[]{1}, partition.isr, partition.toString());
+
+            // The ELR set is not determined but the size is 1.
+            assertEquals(1, partition.elr.length, partition.toString());
+
+            // First, decrease the min ISR config to 1. This should clear the ELR fields.
+            ControllerResult<Map<ConfigResource, ApiError>> result = active.configurationControl().incrementalAlterConfigs(toMap(
+                    entry(new ConfigResource(TOPIC, "foo"), toMap(entry(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, entry(SET, "1"))))),
+                true);
+            assertEquals(2, result.records().size(), result.records().toString());
+            RecordTestUtils.replayAll(active.configurationControl(), singletonList(result.records().get(0)));
+            RecordTestUtils.replayAll(active.replicationControl(), singletonList(result.records().get(1)));
+
+            partition = active.replicationControl().getPartition(topicIdFoo, 0);
+            assertEquals(0, partition.elr.length, partition.toString());
+            assertArrayEquals(new int[]{1}, partition.isr, partition.toString());
+
+            // Second, let's try update config on cluster level with the other topic.
+            partition = active.replicationControl().getPartition(topicIdBar, 0);
+            assertArrayEquals(new int[]{1}, partition.isr, partition.toString());
+            assertEquals(1, partition.elr.length, partition.toString());
+
+            result = active.configurationControl().incrementalAlterConfigs(toMap(
+                    entry(new ConfigResource(BROKER, ""), toMap(entry(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, entry(SET, "1"))))),
+                true);
+            assertEquals(2, result.records().size(), result.records().toString());
+            RecordTestUtils.replayAll(active.configurationControl(), singletonList(result.records().get(0)));
+            RecordTestUtils.replayAll(active.replicationControl(), singletonList(result.records().get(1)));
+
+            partition = active.replicationControl().getPartition(topicIdBar, 0);
+            assertEquals(0, partition.elr.length, partition.toString());
+            assertArrayEquals(new int[]{1}, partition.isr, partition.toString());
         }
     }
 
@@ -508,9 +743,6 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
                 setLeaderImbalanceCheckIntervalNs(OptionalLong.of(leaderImbalanceCheckIntervalNs)).
                 setBootstrapMetadata(SIMPLE_BOOTSTRAP).
@@ -527,7 +759,7 @@ public class QuorumControllerTest {
                     new BrokerRegistrationRequestData().
                         setBrokerId(brokerId).
                         setClusterId(active.clusterId()).
-                        setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                        setFeatures(brokerFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                         setIncarnationId(Uuid.randomUuid()).
                         setListeners(listeners));
                 brokerEpochs.put(brokerId, reply.get().epoch());
@@ -585,7 +817,7 @@ public class QuorumControllerTest {
                     new BrokerRegistrationRequestData().
                         setBrokerId(brokerId).
                         setClusterId(active.clusterId()).
-                        setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                        setFeatures(brokerFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                         setIncarnationId(Uuid.randomUuid()).
                         setListeners(listeners));
                 brokerEpochs.put(brokerId, reply.get().epoch());
@@ -597,7 +829,8 @@ public class QuorumControllerTest {
             // Let the unfenced broker, 3, join the ISR partition 2
             Set<TopicIdPartition> imbalancedPartitions = new HashSet<>(active.replicationControl().imbalancedPartitions());
             assertEquals(1, imbalancedPartitions.size());
-            int imbalancedPartitionId = imbalancedPartitions.iterator().next().partitionId();
+            TopicIdPartition impalancedTp = imbalancedPartitions.iterator().next();
+            int imbalancedPartitionId = impalancedTp.partitionId();
             PartitionRegistration partitionRegistration = active.replicationControl().getPartition(topicIdFoo, imbalancedPartitionId);
             AlterPartitionRequestData.PartitionData partitionData = new AlterPartitionRequestData.PartitionData()
                 .setPartitionIndex(imbalancedPartitionId)
@@ -606,7 +839,7 @@ public class QuorumControllerTest {
                 .setNewIsrWithEpochs(AlterPartitionRequest.newIsrToSimpleNewIsrWithBrokerEpochs(Arrays.asList(1, 2, 3)));
 
             AlterPartitionRequestData.TopicData topicData = new AlterPartitionRequestData.TopicData()
-                .setTopicName("foo");
+                .setTopicId(impalancedTp.topicId());
             topicData.partitions().add(partitionData);
 
             AlterPartitionRequestData alterPartitionRequest = new AlterPartitionRequestData()
@@ -615,7 +848,7 @@ public class QuorumControllerTest {
             alterPartitionRequest.topics().add(topicData);
 
             active.alterPartition(ANONYMOUS_CONTEXT, new AlterPartitionRequest
-                .Builder(alterPartitionRequest, false).build((short) 0).data()).get();
+                .Builder(alterPartitionRequest).build(ApiKeys.ALTER_PARTITION.oldestVersion()).data()).get();
 
             AtomicLong lastHeartbeatMs = new AtomicLong(getMonotonicMs(active.time()));
             sendBrokerHeartbeatToUnfenceBrokers(active, allBrokers, brokerEpochs);
@@ -643,16 +876,15 @@ public class QuorumControllerTest {
 
     @Test
     public void testNoOpRecordWriteAfterTimeout() throws Throwable {
-        long maxIdleIntervalNs = 1_000;
-        long maxReplicationDelayMs = 60_000;
+        long maxIdleIntervalNs = TimeUnit.MICROSECONDS.toNanos(100);
+        long maxReplicationDelayMs = 1_000;
         try (
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(3).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder -> {
-                    controllerBuilder.setConfigSchema(SCHEMA);
-                    controllerBuilder.setMaxIdleIntervalNs(OptionalLong.of(maxIdleIntervalNs));
-                }).
+                setControllerBuilderInitializer(controllerBuilder ->
+                    controllerBuilder.setMaxIdleIntervalNs(OptionalLong.of(maxIdleIntervalNs))
+                ).
                 build()
         ) {
             ListenerCollection listeners = new ListenerCollection();
@@ -688,15 +920,65 @@ public class QuorumControllerTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource(value = {"0, 0", "0, 1", "1, 0", "1, 1"})
+    public void testRegisterBrokerKRaftVersions(short finalizedKraftVersion, short brokerMaxSupportedKraftVersion) throws Throwable {
+        try (
+            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
+                setLastKRaftVersion(KRaftVersion.fromFeatureLevel(finalizedKraftVersion)).
+                build();
+            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
+                setBootstrapMetadata(SIMPLE_BOOTSTRAP).
+                build()
+        ) {
+            ListenerCollection listeners = new ListenerCollection();
+            listeners.add(new Listener().setName("PLAINTEXT").
+                setHost("localhost").setPort(9092));
+            QuorumController active = controlEnv.activeController();
+            BrokerRegistrationRequestData.FeatureCollection brokerFeatures = new BrokerRegistrationRequestData.FeatureCollection();
+            brokerFeatures.add(new BrokerRegistrationRequestData.Feature()
+                .setName(MetadataVersion.FEATURE_NAME)
+                .setMinSupportedVersion(MetadataVersion.MINIMUM_VERSION.featureLevel())
+                .setMaxSupportedVersion(MetadataVersion.latestTesting().featureLevel()));
+            // broker registration requests do not include initial versions of features
+            if (brokerMaxSupportedKraftVersion != 0) {
+                brokerFeatures.add(new BrokerRegistrationRequestData.Feature()
+                    .setName(KRaftVersion.FEATURE_NAME)
+                    .setMinSupportedVersion(Feature.KRAFT_VERSION.minimumProduction())
+                    .setMaxSupportedVersion(brokerMaxSupportedKraftVersion));
+            }
+            BrokerRegistrationRequestData request = new BrokerRegistrationRequestData().
+                setBrokerId(0).
+                setClusterId(active.clusterId()).
+                setIncarnationId(Uuid.fromString("kxAT73dKQsitIedpiPtwBA")).
+                setFeatures(brokerFeatures).
+                setLogDirs(Collections.singletonList(Uuid.fromString("vBpaRsZVSaGsQT53wtYGtg"))).
+                setListeners(listeners);
+
+            if (brokerMaxSupportedKraftVersion < finalizedKraftVersion) {
+                Throwable exception = assertThrows(ExecutionException.class, () -> active.registerBroker(
+                    ANONYMOUS_CONTEXT,
+                    request).get());
+                assertEquals(UnsupportedVersionException.class, exception.getCause().getClass());
+                assertEquals("Unable to register because the broker does not support finalized version " +
+                        finalizedKraftVersion + " of kraft.version. The broker wants a version between 0 and " +
+                        brokerMaxSupportedKraftVersion + ", inclusive.",
+                    exception.getCause().getMessage());
+            } else {
+                BrokerRegistrationReply reply = active.registerBroker(
+                    ANONYMOUS_CONTEXT,
+                    request).get();
+                assertTrue(reply.epoch() >= 4, "Unexpected broker epoch " + reply.epoch());
+            }
+        }
+    }
+
     @Test
     public void testUnregisterBroker() throws Throwable {
         try (
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 build()
         ) {
             ListenerCollection listeners = new ListenerCollection();
@@ -709,10 +991,11 @@ public class QuorumControllerTest {
                     setBrokerId(0).
                     setClusterId(active.clusterId()).
                     setIncarnationId(Uuid.fromString("kxAT73dKQsitIedpiPtwBA")).
-                    setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.latestTesting())).
+                    setFeatures(brokerFeaturesPlusFeatureVersions(MetadataVersion.MINIMUM_VERSION, MetadataVersion.latestTesting(),
+                        Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_1.featureLevel()))).
                     setLogDirs(Collections.singletonList(Uuid.fromString("vBpaRsZVSaGsQT53wtYGtg"))).
                     setListeners(listeners));
-            assertEquals(5L, reply.get().epoch());
+            assertEquals(6L, reply.get().epoch());
             CreateTopicsRequestData createTopicsRequestData =
                 new CreateTopicsRequestData().setTopics(
                     new CreatableTopicCollection(Collections.singleton(
@@ -728,7 +1011,7 @@ public class QuorumControllerTest {
                         get().topics().find("foo").errorMessage());
             assertEquals(new BrokerHeartbeatReply(true, false, false, false),
                 active.processBrokerHeartbeat(ANONYMOUS_CONTEXT, new BrokerHeartbeatRequestData().
-                        setWantFence(false).setBrokerEpoch(5L).setBrokerId(0).
+                        setWantFence(false).setBrokerEpoch(6L).setBrokerId(0).
                         setCurrentMetadataOffset(100000L)).get());
             assertEquals(Errors.NONE.code(), active.createTopics(ANONYMOUS_CONTEXT,
                 createTopicsRequestData, Collections.singleton("foo")).
@@ -776,9 +1059,6 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(3).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 setBootstrapMetadata(SIMPLE_BOOTSTRAP).
                 build()
         ) {
@@ -802,7 +1082,7 @@ public class QuorumControllerTest {
                             singletonList(
                                 new ControllerRegistrationRequestData.Feature().
                                     setName(MetadataVersion.FEATURE_NAME).
-                                    setMinSupportedVersion(MetadataVersion.MINIMUM_KRAFT_VERSION.featureLevel()).
+                                    setMinSupportedVersion(MetadataVersion.MINIMUM_VERSION.featureLevel()).
                                     setMaxSupportedVersion(MetadataVersion.IBP_3_7_IV0.featureLevel())
                             ).iterator()
                         ))).get();
@@ -813,7 +1093,7 @@ public class QuorumControllerTest {
                         setBrokerId(i).
                         setRack(null).
                         setClusterId(active.clusterId()).
-                        setFeatures(brokerFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                        setFeatures(brokerFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                         setIncarnationId(Uuid.fromString("kxAT73dKQsitIedpiPtwB" + i)).
                         setListeners(new ListenerCollection(singletonList(new Listener().
                             setName("PLAINTEXT").setHost("localhost").
@@ -835,10 +1115,10 @@ public class QuorumControllerTest {
                                 Arrays.asList(new CreatableReplicaAssignment().
                                     setPartitionIndex(0).
                                     setBrokerIds(Arrays.asList(0, 1, 2)),
-                                new CreatableReplicaAssignment().
-                                    setPartitionIndex(1).
-                                    setBrokerIds(Arrays.asList(1, 2, 0))).
-                                        iterator()))).iterator())),
+                                    new CreatableReplicaAssignment().
+                                        setPartitionIndex(1).
+                                        setBrokerIds(Arrays.asList(1, 2, 0))).
+                                            iterator()))).iterator())),
                 Collections.singleton("foo")).get();
             fooId = fooData.topics().find("foo").topicId();
             active.allocateProducerIds(ANONYMOUS_CONTEXT,
@@ -857,8 +1137,6 @@ public class QuorumControllerTest {
             new ApiMessageAndVersion(new FeatureLevelRecord().
                 setName(MetadataVersion.FEATURE_NAME).
                 setFeatureLevel(MetadataVersion.IBP_3_7_IV0.featureLevel()), (short) 0),
-            new ApiMessageAndVersion(new ZkMigrationStateRecord().
-                setZkMigrationState((byte) 0), (short) 0),
             new ApiMessageAndVersion(new EndTransactionRecord(), (short) 0),
             new ApiMessageAndVersion(new RegisterControllerRecord().
                 setControllerId(0).
@@ -874,7 +1152,7 @@ public class QuorumControllerTest {
                     singletonList(
                         new RegisterControllerRecord.ControllerFeature().
                             setName(MetadataVersion.FEATURE_NAME).
-                            setMinSupportedVersion(MetadataVersion.MINIMUM_KRAFT_VERSION.featureLevel()).
+                            setMinSupportedVersion(MetadataVersion.MINIMUM_VERSION.featureLevel()).
                             setMaxSupportedVersion(MetadataVersion.IBP_3_7_IV0.featureLevel())).iterator())),
                     (short) 0),
             new ApiMessageAndVersion(new RegisterControllerRecord().
@@ -891,7 +1169,7 @@ public class QuorumControllerTest {
                     singletonList(
                         new RegisterControllerRecord.ControllerFeature().
                             setName(MetadataVersion.FEATURE_NAME).
-                            setMinSupportedVersion(MetadataVersion.MINIMUM_KRAFT_VERSION.featureLevel()).
+                            setMinSupportedVersion(MetadataVersion.MINIMUM_VERSION.featureLevel()).
                             setMaxSupportedVersion(MetadataVersion.IBP_3_7_IV0.featureLevel())).iterator())),
                     (short) 0),
             new ApiMessageAndVersion(new RegisterControllerRecord().
@@ -908,7 +1186,7 @@ public class QuorumControllerTest {
                     singletonList(
                         new RegisterControllerRecord.ControllerFeature().
                             setName(MetadataVersion.FEATURE_NAME).
-                            setMinSupportedVersion(MetadataVersion.MINIMUM_KRAFT_VERSION.featureLevel()).
+                            setMinSupportedVersion(MetadataVersion.MINIMUM_VERSION.featureLevel()).
                             setMaxSupportedVersion(MetadataVersion.IBP_3_7_IV0.featureLevel())).iterator())),
                 (short) 0),
             new ApiMessageAndVersion(new RegisterBrokerRecord().
@@ -917,7 +1195,7 @@ public class QuorumControllerTest {
                 setEndPoints(new BrokerEndpointCollection(
                     singletonList(new BrokerEndpoint().setName("PLAINTEXT").setHost("localhost").
                         setPort(9092).setSecurityProtocol((short) 0)).iterator())).
-                setFeatures(registrationFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                setFeatures(registrationFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                 setRack(null).
                 setFenced(true), (short) 2),
             new ApiMessageAndVersion(new RegisterBrokerRecord().
@@ -926,7 +1204,7 @@ public class QuorumControllerTest {
                 setEndPoints(new BrokerEndpointCollection(singletonList(
                     new BrokerEndpoint().setName("PLAINTEXT").setHost("localhost").
                         setPort(9093).setSecurityProtocol((short) 0)).iterator())).
-                setFeatures(registrationFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                setFeatures(registrationFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                 setRack(null).
                 setFenced(true), (short) 2),
             new ApiMessageAndVersion(new RegisterBrokerRecord().
@@ -935,7 +1213,7 @@ public class QuorumControllerTest {
                 setEndPoints(new BrokerEndpointCollection(
                     singletonList(new BrokerEndpoint().setName("PLAINTEXT").setHost("localhost").
                         setPort(9094).setSecurityProtocol((short) 0)).iterator())).
-                setFeatures(registrationFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                setFeatures(registrationFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                 setRack(null).
                 setFenced(true), (short) 2),
             new ApiMessageAndVersion(new RegisterBrokerRecord().
@@ -944,7 +1222,7 @@ public class QuorumControllerTest {
                 setEndPoints(new BrokerEndpointCollection(singletonList(
                     new BrokerEndpoint().setName("PLAINTEXT").setHost("localhost").
                         setPort(9095).setSecurityProtocol((short) 0)).iterator())).
-                setFeatures(registrationFeatures(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_3_7_IV0)).
+                setFeatures(registrationFeatures(MetadataVersion.MINIMUM_VERSION, MetadataVersion.IBP_3_7_IV0)).
                 setRack(null).
                 setFenced(true), (short) 2),
             new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().
@@ -986,9 +1264,6 @@ public class QuorumControllerTest {
         try (
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 build()
         ) {
             QuorumController controller = controlEnv.activeController();
@@ -1051,9 +1326,6 @@ public class QuorumControllerTest {
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 build()
         ) {
             QuorumController controller = controlEnv.activeController();
@@ -1087,124 +1359,12 @@ public class QuorumControllerTest {
         }
     }
 
-    @Disabled // TODO: need to fix leader election in LocalLog.
-    @Test
-    public void testMissingInMemorySnapshot() throws Exception {
-        int numBrokers = 3;
-        int numPartitions = 3;
-        String topicName = "topic-name";
-
-        try (
-            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
-                build();
-            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
-                build()
-        ) {
-            QuorumController controller = controlEnv.activeController();
-
-            Map<Integer, Long> brokerEpochs = registerBrokersAndUnfence(controller, numBrokers);
-
-            // Create a lot of partitions
-            List<CreatableReplicaAssignment> partitions = IntStream
-                .range(0, numPartitions)
-                .mapToObj(partitionIndex -> new CreatableReplicaAssignment()
-                    .setPartitionIndex(partitionIndex)
-                    .setBrokerIds(Arrays.asList(0, 1, 2))
-                )
-                .collect(Collectors.toList());
-
-            Uuid topicId = controller.createTopics(ANONYMOUS_CONTEXT, new CreateTopicsRequestData()
-                    .setTopics(new CreatableTopicCollection(Collections.singleton(new CreatableTopic()
-                        .setName(topicName)
-                        .setNumPartitions(-1)
-                        .setReplicationFactor((short) -1)
-                        .setAssignments(new CreatableReplicaAssignmentCollection(partitions.iterator()))
-                    ).iterator())),
-                Collections.singleton("foo")).get().topics().find(topicName).topicId();
-
-            // Create a lot of alter isr
-            List<AlterPartitionRequestData.PartitionData> alterPartitions = IntStream
-                .range(0, numPartitions)
-                .mapToObj(partitionIndex -> {
-                    PartitionRegistration partitionRegistration = controller.replicationControl().getPartition(
-                        topicId,
-                        partitionIndex
-                    );
-
-                    return new AlterPartitionRequestData.PartitionData()
-                        .setPartitionIndex(partitionIndex)
-                        .setLeaderEpoch(partitionRegistration.leaderEpoch)
-                        .setPartitionEpoch(partitionRegistration.partitionEpoch)
-                        .setNewIsrWithEpochs(AlterPartitionRequest.newIsrToSimpleNewIsrWithBrokerEpochs(Arrays.asList(0, 1)));
-                })
-                .collect(Collectors.toList());
-
-            AlterPartitionRequestData.TopicData topicData = new AlterPartitionRequestData.TopicData()
-                .setTopicName(topicName);
-            topicData.partitions().addAll(alterPartitions);
-
-            int leaderId = 0;
-            AlterPartitionRequestData alterPartitionRequest = new AlterPartitionRequestData()
-                .setBrokerId(leaderId)
-                .setBrokerEpoch(brokerEpochs.get(leaderId));
-            alterPartitionRequest.topics().add(topicData);
-
-            logEnv.logManagers().get(0).resignAfterNonAtomicCommit();
-
-            int oldClaimEpoch = controller.curClaimEpoch();
-            assertThrows(ExecutionException.class,
-                () -> controller.alterPartition(ANONYMOUS_CONTEXT, new AlterPartitionRequest
-                    .Builder(alterPartitionRequest, false).build((short) 0).data()).get());
-
-            // Wait for the controller to become active again
-            assertSame(controller, controlEnv.activeController());
-            assertTrue(
-                oldClaimEpoch < controller.curClaimEpoch(),
-                String.format("oldClaimEpoch = %s, newClaimEpoch = %s", oldClaimEpoch, controller.curClaimEpoch())
-            );
-
-            // Since the alterPartition partially failed we expect to see
-            // some partitions to still have 2 in the ISR.
-            int partitionsWithReplica2 = Utils.toList(
-                controller
-                    .replicationControl()
-                    .brokersToIsrs()
-                    .partitionsWithBrokerInIsr(2)
-            ).size();
-            int partitionsWithReplica0 = Utils.toList(
-                controller
-                    .replicationControl()
-                    .brokersToIsrs()
-                    .partitionsWithBrokerInIsr(0)
-            ).size();
-
-            assertEquals(numPartitions, partitionsWithReplica0);
-            assertNotEquals(0, partitionsWithReplica2);
-            assertTrue(
-                partitionsWithReplica0 > partitionsWithReplica2,
-                String.format(
-                    "partitionsWithReplica0 = %s, partitionsWithReplica2 = %s",
-                    partitionsWithReplica0,
-                    partitionsWithReplica2
-                )
-            );
-
-            testToImages(logEnv.allRecords());
-        }
-    }
-
     @Test
     public void testConfigResourceExistenceChecker() throws Throwable {
         try (
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(3).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 build()
         ) {
             QuorumController active = controlEnv.activeController();
@@ -1333,28 +1493,11 @@ public class QuorumControllerTest {
         }
     }
 
-    private static final List<ApiMessageAndVersion> PRE_PRODUCTION_RECORDS =
-            Collections.unmodifiableList(Arrays.asList(
-                new ApiMessageAndVersion(new RegisterBrokerRecord().
-                        setBrokerEpoch(42).
-                        setBrokerId(123).
-                        setIncarnationId(Uuid.fromString("v78Gbc6sQXK0y5qqRxiryw")).
-                        setRack(null),
-                        (short) 0),
-                new ApiMessageAndVersion(new UnfenceBrokerRecord().
-                        setEpoch(42).
-                        setId(123),
-                        (short) 0),
-                new ApiMessageAndVersion(new TopicRecord().
-                        setName("bar").
-                        setTopicId(Uuid.fromString("cxBT72dK4si8Ied1iP4wBA")),
-                        (short) 0)));
-
     private static final BootstrapMetadata COMPLEX_BOOTSTRAP = BootstrapMetadata.fromRecords(
             Arrays.asList(
                 new ApiMessageAndVersion(new FeatureLevelRecord().
                         setName(MetadataVersion.FEATURE_NAME).
-                        setFeatureLevel(MetadataVersion.IBP_3_3_IV1.featureLevel()),
+                        setFeatureLevel(MetadataVersion.MINIMUM_VERSION.featureLevel()),
                         (short) 0),
                 new ApiMessageAndVersion(new ConfigRecord().
                         setResourceType(BROKER.id()).
@@ -1365,42 +1508,11 @@ public class QuorumControllerTest {
             "test bootstrap");
 
     @Test
-    public void testUpgradeFromPreProductionVersion() throws Exception {
-        try (
-            InitialSnapshot initialSnapshot = new InitialSnapshot(PRE_PRODUCTION_RECORDS);
-            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(3).
-                setSnapshotReader(FileRawSnapshotReader.open(
-                    initialSnapshot.tempDir.toPath(), new OffsetAndEpoch(0, 0))).
-                build();
-            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
-                setBootstrapMetadata(COMPLEX_BOOTSTRAP).
-                build()
-        ) {
-            QuorumController active = controlEnv.activeController();
-            TestUtils.waitForCondition(() ->
-                active.featureControl().metadataVersion().equals(MetadataVersion.IBP_3_0_IV1),
-                "Failed to get a metadata.version of " + MetadataVersion.IBP_3_0_IV1);
-            // The ConfigRecord in our bootstrap should not have been applied, since there
-            // were already records present.
-            assertEquals(Collections.emptyMap(), active.configurationControl().
-                    getConfigs(new ConfigResource(BROKER, "")));
-
-            testToImages(logEnv.allRecords());
-        }
-    }
-
-    @Test
     public void testInsertBootstrapRecordsToEmptyLog() throws Exception {
         try (
             LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(3).
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setConfigSchema(SCHEMA)
-                ).
                 setBootstrapMetadata(COMPLEX_BOOTSTRAP).
                 build()
         ) {
@@ -1412,7 +1524,7 @@ public class QuorumControllerTest {
             TestUtils.waitForCondition(() -> {
                 FinalizedControllerFeatures features = active.finalizedFeatures(ctx).get();
                 Optional<Short> metadataVersionOpt = features.get(MetadataVersion.FEATURE_NAME);
-                return Optional.of(MetadataVersion.IBP_3_3_IV1.featureLevel()).equals(metadataVersionOpt);
+                return Optional.of(MetadataVersion.MINIMUM_VERSION.featureLevel()).equals(metadataVersionOpt);
             }, "Failed to see expected metadata.version from bootstrap metadata");
 
             TestUtils.waitForCondition(() -> {
@@ -1475,92 +1587,20 @@ public class QuorumControllerTest {
                         appender)).getMessage());
     }
 
-    @Test
-    public void testBootstrapZkMigrationRecord() throws Exception {
-        assertEquals(ZkMigrationState.PRE_MIGRATION,
-            checkBootstrapZkMigrationRecord(MetadataVersion.IBP_3_4_IV0, true));
-
-        assertEquals(ZkMigrationState.NONE,
-            checkBootstrapZkMigrationRecord(MetadataVersion.IBP_3_4_IV0, false));
-
-        assertEquals(ZkMigrationState.NONE,
-            checkBootstrapZkMigrationRecord(MetadataVersion.IBP_3_3_IV0, false));
-
-        assertEquals(
-            "The bootstrap metadata.version 3.3-IV0 does not support ZK migrations. Cannot continue with ZK migrations enabled.",
-            assertThrows(FaultHandlerException.class, () ->
-                checkBootstrapZkMigrationRecord(MetadataVersion.IBP_3_3_IV0, true)).getCause().getMessage()
-        );
-    }
-
-    public ZkMigrationState checkBootstrapZkMigrationRecord(
-        MetadataVersion metadataVersion,
-        boolean migrationEnabled
-    ) throws Exception {
-        try (
-            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).build();
-            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder.setZkMigrationEnabled(migrationEnabled)
-                ).
-                setBootstrapMetadata(BootstrapMetadata.fromVersion(metadataVersion, "test")).
-                build()
-        ) {
-            QuorumController active = controlEnv.activeController();
-            ZkMigrationState zkMigrationState = active.appendReadEvent("read migration state", OptionalLong.empty(),
-                () -> active.featureControl().zkMigrationState()).get(30, TimeUnit.SECONDS);
-            testToImages(logEnv.allRecords());
-            return zkMigrationState;
-        }
-    }
-
-    @Test
-    public void testUpgradeMigrationStateFrom34() throws Exception {
-        try (LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).build()) {
-            // In 3.4, we only wrote a PRE_MIGRATION to the log. In that software version, we defined this
-            // as enum value 1. In 3.5+ software, this enum value is redefined as MIGRATION
-            BootstrapMetadata bootstrapMetadata = BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_4_IV0, "test");
-            List<ApiMessageAndVersion> initialRecords = new ArrayList<>(bootstrapMetadata.records());
-            initialRecords.add(ZkMigrationState.of((byte) 1).toRecord());
-            logEnv.appendInitialRecords(initialRecords);
-            try (
-                QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
-                    setControllerBuilderInitializer(controllerBuilder ->
-                        controllerBuilder.setZkMigrationEnabled(true)
-                    ).
-                    setBootstrapMetadata(bootstrapMetadata).
-                    build()
-            ) {
-                QuorumController active = controlEnv.activeController();
-                assertEquals(active.featureControl().zkMigrationState(), ZkMigrationState.MIGRATION);
-                assertFalse(active.featureControl().inPreMigrationMode());
-            }
-
-            testToImages(logEnv.allRecords());
-        }
-    }
-
-    FeatureControlManager getActivationRecords(
-            MetadataVersion metadataVersion,
-            Optional<ZkMigrationState> stateInLog,
-            boolean zkMigrationEnabled
-    ) {
+    FeatureControlManager getActivationRecords(MetadataVersion metadataVersion) {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         FeatureControlManager featureControlManager = new FeatureControlManager.Builder()
                 .setSnapshotRegistry(snapshotRegistry)
                 .setMetadataVersion(metadataVersion)
                 .build();
 
-        stateInLog.ifPresent(zkMigrationState ->
-            featureControlManager.replay((ZkMigrationStateRecord) zkMigrationState.toRecord().message()));
-
         ControllerResult<Void> result = ActivationRecordsGenerator.generate(
             msg -> { },
-            !stateInLog.isPresent(),
+            true,
             -1L,
-            zkMigrationEnabled,
             BootstrapMetadata.fromVersion(metadataVersion, "test"),
-            featureControlManager);
+            metadataVersion,
+            3);
         RecordTestUtils.replayAll(featureControlManager, result.records());
         return featureControlManager;
     }
@@ -1569,90 +1609,34 @@ public class QuorumControllerTest {
     public void testActivationRecords33() {
         FeatureControlManager featureControl;
 
-        assertEquals(
-            "The bootstrap metadata.version 3.3-IV0 does not support ZK migrations. Cannot continue with ZK migrations enabled.",
-            assertThrows(RuntimeException.class, () -> getActivationRecords(MetadataVersion.IBP_3_3_IV0, Optional.empty(), true)).getMessage()
-        );
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_3_IV0, Optional.empty(), false);
-        assertEquals(MetadataVersion.IBP_3_3_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
-
-        assertEquals(
-            "Should not have ZK migrations enabled on a cluster running metadata.version 3.3-IV0",
-            assertThrows(RuntimeException.class, () -> getActivationRecords(MetadataVersion.IBP_3_3_IV0, Optional.of(ZkMigrationState.NONE), true)).getMessage()
-        );
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_3_IV0, Optional.of(ZkMigrationState.NONE), false);
-        assertEquals(MetadataVersion.IBP_3_3_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
+        featureControl = getActivationRecords(MetadataVersion.IBP_3_3_IV3);
+        assertEquals(MetadataVersion.IBP_3_3_IV3, featureControl.metadataVersion());
     }
 
     @Test
     public void testActivationRecords34() {
         FeatureControlManager featureControl;
 
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.empty(), true);
+        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0);
         assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.PRE_MIGRATION, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.empty(), false);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
-
-        assertEquals(
-            "Should not have ZK migrations enabled on a cluster that was created in KRaft mode.",
-            assertThrows(RuntimeException.class, () -> getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.NONE), true)).getMessage()
-        );
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.NONE), false);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.PRE_MIGRATION), true);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.PRE_MIGRATION, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.MIGRATION), true);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.MIGRATION, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.MIGRATION), false);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.POST_MIGRATION, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.POST_MIGRATION), true);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.POST_MIGRATION, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.POST_MIGRATION), false);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.POST_MIGRATION, featureControl.zkMigrationState());
     }
 
     @Test
     public void testActivationRecordsNonEmptyLog() {
         FeatureControlManager featureControl = getActivationRecords(
-            MetadataVersion.IBP_3_4_IV0, Optional.empty(), true);
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.PRE_MIGRATION, featureControl.zkMigrationState());
+            MetadataVersion.IBP_3_9_IV0);
+        assertEquals(MetadataVersion.IBP_3_9_IV0, featureControl.metadataVersion());
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    public void testActivationRecordsPartialBootstrap(boolean zkMigrationEnabled) {
-        FeatureControlManager featureControlManager = new FeatureControlManager.Builder()
-            .setSnapshotRegistry(new SnapshotRegistry(new LogContext()))
-            .setMetadataVersion(MetadataVersion.IBP_3_6_IV1)
-            .build();
-
+    @Test
+    public void testActivationRecordsPartialBootstrap() {
         ControllerResult<Void> result = ActivationRecordsGenerator.generate(
             logMsg -> { },
             true,
             0L,
-            zkMigrationEnabled,
             BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV1, "test"),
-            featureControlManager);
+            MetadataVersion.IBP_3_6_IV1,
+            3);
         assertFalse(result.isAtomic());
         assertTrue(RecordTestUtils.recordAtIndexAs(
             AbortTransactionRecord.class, result.records(), 0).isPresent());
@@ -1660,27 +1644,6 @@ public class QuorumControllerTest {
             BeginTransactionRecord.class, result.records(), 1).isPresent());
         assertTrue(RecordTestUtils.recordAtIndexAs(
             EndTransactionRecord.class, result.records(), result.records().size() - 1).isPresent());
-    }
-
-    @Test
-    public void testMigrationsEnabledForOldBootstrapMetadataVersion() throws Exception {
-        try (
-            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).build()
-        ) {
-            QuorumControllerTestEnv.Builder controlEnvBuilder = new QuorumControllerTestEnv.Builder(logEnv).
-                    setControllerBuilderInitializer(controllerBuilder ->
-                        controllerBuilder.setZkMigrationEnabled(true)
-                    ).
-                    setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_3_IV0, "test"));
-
-            QuorumControllerTestEnv controlEnv = controlEnvBuilder.build();
-            QuorumController active = controlEnv.activeController();
-            assertEquals(ZkMigrationState.NONE, active.appendReadEvent("read migration state", OptionalLong.empty(),
-                () -> active.featureControl().zkMigrationState()).get(30, TimeUnit.SECONDS));
-            assertThrows(FaultHandlerException.class, controlEnv::close);
-
-            testToImages(logEnv.allRecords());
-        }
     }
 
     /**
@@ -1711,12 +1674,6 @@ public class QuorumControllerTest {
 
     @Test
     public void testActivationRecordsPartialTransaction() {
-        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
-        FeatureControlManager featureControlManager = new FeatureControlManager.Builder()
-            .setSnapshotRegistry(snapshotRegistry)
-            .setMetadataVersion(MetadataVersion.IBP_3_6_IV1)
-            .build();
-
         OffsetControlManager offsetControlManager = new OffsetControlManager.Builder().build();
         offsetControlManager.replay(new BeginTransactionRecord(), 10);
         offsetControlManager.handleCommitBatch(Batch.data(20, 1, 1L, 0,
@@ -1726,9 +1683,9 @@ public class QuorumControllerTest {
             logMsg -> { },
             false,
             offsetControlManager.transactionStartOffset(),
-            false,
             BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV1, "test"),
-            featureControlManager);
+            MetadataVersion.IBP_3_6_IV1,
+            3);
 
         assertTrue(result.isAtomic());
         offsetControlManager.replay(
@@ -1740,12 +1697,6 @@ public class QuorumControllerTest {
 
     @Test
     public void testActivationRecordsPartialTransactionNoSupport() {
-        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
-        FeatureControlManager featureControlManager = new FeatureControlManager.Builder()
-            .setSnapshotRegistry(snapshotRegistry)
-            .setMetadataVersion(MetadataVersion.IBP_3_6_IV0)
-            .build();
-
         OffsetControlManager offsetControlManager = new OffsetControlManager.Builder().build();
         offsetControlManager.replay(new BeginTransactionRecord(), 10);
         offsetControlManager.handleCommitBatch(Batch.data(20, 1, 1L, 0,
@@ -1756,129 +1707,8 @@ public class QuorumControllerTest {
                 msg -> { },
                 false,
                 offsetControlManager.transactionStartOffset(),
-                false,
                 BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV0, "test"),
-                featureControlManager)
-        );
-    }
-
-    private static final List<ApiMessageAndVersion> ZK_MIGRATION_RECORDS =
-        Collections.unmodifiableList(Arrays.asList(
-            new ApiMessageAndVersion(new TopicRecord().
-                setName("spam").
-                setTopicId(Uuid.fromString("qvRJLpDYRHmgEi8_TPBYTQ")),
-                (short) 0),
-            new ApiMessageAndVersion(new PartitionRecord().setPartitionId(0).
-                setTopicId(Uuid.fromString("qvRJLpDYRHmgEi8_TPBYTQ")).setReplicas(Arrays.asList(0, 1, 2)).
-                setIsr(Arrays.asList(0, 1, 2)).setRemovingReplicas(Collections.emptyList()).
-                setAddingReplicas(Collections.emptyList()).setLeader(0).setLeaderEpoch(0).
-                setPartitionEpoch(0), (short) 0),
-            new ApiMessageAndVersion(new PartitionRecord().setPartitionId(1).
-                setTopicId(Uuid.fromString("qvRJLpDYRHmgEi8_TPBYTQ")).setReplicas(Arrays.asList(1, 2, 0)).
-                setIsr(Arrays.asList(1, 2, 0)).setRemovingReplicas(Collections.emptyList()).
-                setAddingReplicas(Collections.emptyList()).setLeader(1).setLeaderEpoch(0).
-                setPartitionEpoch(0), (short) 0)
-            ));
-
-    @Test
-    public void testFailoverDuringMigrationTransaction() throws Exception {
-        try (
-            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(3).build()
-        ) {
-            QuorumControllerTestEnv.Builder controlEnvBuilder = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder -> controllerBuilder.setZkMigrationEnabled(true)).
-                setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV1, "test"));
-            QuorumControllerTestEnv controlEnv = controlEnvBuilder.build();
-            QuorumController active = controlEnv.activeController(true);
-            ZkRecordConsumer migrationConsumer = active.zkRecordConsumer();
-            migrationConsumer.beginMigration().get(30, TimeUnit.SECONDS);
-            migrationConsumer.acceptBatch(ZK_MIGRATION_RECORDS).get(30, TimeUnit.SECONDS);
-            forceRenounce(active);
-
-            // Ensure next controller doesn't see the topic from partial migration
-            QuorumController newActive = controlEnv.activeController(true);
-            CompletableFuture<Map<String, ResultOrError<Uuid>>> results =
-                newActive.findTopicIds(ANONYMOUS_CONTEXT, Collections.singleton("spam"));
-            assertEquals(
-                Errors.UNKNOWN_TOPIC_OR_PARTITION,
-                results.get(30, TimeUnit.SECONDS).get("spam").error().error());
-
-            assertEquals(
-                ZkMigrationState.PRE_MIGRATION,
-                newActive.appendReadEvent("read migration state", OptionalLong.empty(),
-                    () -> newActive.featureControl().zkMigrationState()
-                ).get(30, TimeUnit.SECONDS)
-            );
-            // Ensure the migration can happen on new active controller
-            migrationConsumer = newActive.zkRecordConsumer();
-            migrationConsumer.beginMigration().get(30, TimeUnit.SECONDS);
-            migrationConsumer.acceptBatch(ZK_MIGRATION_RECORDS).get(30, TimeUnit.SECONDS);
-            migrationConsumer.completeMigration().get(30, TimeUnit.SECONDS);
-
-            results = newActive.findTopicIds(ANONYMOUS_CONTEXT, Collections.singleton("spam"));
-            assertTrue(results.get(30, TimeUnit.SECONDS).get("spam").isResult());
-
-            assertEquals(ZkMigrationState.MIGRATION, newActive.appendReadEvent("read migration state", OptionalLong.empty(),
-                () -> newActive.featureControl().zkMigrationState()).get(30, TimeUnit.SECONDS));
-
-        }
-    }
-
-    @ParameterizedTest
-    @EnumSource(value = MetadataVersion.class, names = {"IBP_3_4_IV0", "IBP_3_5_IV0", "IBP_3_6_IV0", "IBP_3_6_IV1"})
-    public void testBrokerHeartbeatDuringMigration(MetadataVersion metadataVersion) throws Exception {
-        try (
-            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).build()
-        ) {
-            QuorumControllerTestEnv.Builder controlEnvBuilder = new QuorumControllerTestEnv.Builder(logEnv).
-                setControllerBuilderInitializer(controllerBuilder ->
-                    controllerBuilder
-                        .setZkMigrationEnabled(true)
-                        .setMaxIdleIntervalNs(OptionalLong.of(TimeUnit.MILLISECONDS.toNanos(100)))
-                ).
-                setBootstrapMetadata(BootstrapMetadata.fromVersion(metadataVersion, "test"));
-            QuorumControllerTestEnv controlEnv = controlEnvBuilder.build();
-            QuorumController active = controlEnv.activeController(true);
-
-            // Register a ZK broker
-            BrokerRegistrationReply reply = active.registerBroker(ANONYMOUS_CONTEXT,
-                new BrokerRegistrationRequestData().
-                    setBrokerId(0).
-                    setRack(null).
-                    setClusterId(active.clusterId()).
-                    setIsMigratingZkBroker(true).
-                    setFeatures(brokerFeatures(metadataVersion, metadataVersion)).
-                    setIncarnationId(Uuid.fromString("kxAT73dKQsitIedpiPtwB0")).
-                    setListeners(new ListenerCollection(singletonList(new Listener().
-                        setName("PLAINTEXT").setHost("localhost").
-                        setPort(9092)).iterator()))).get();
-
-            // Start migration
-            ZkRecordConsumer migrationConsumer = active.zkRecordConsumer();
-            migrationConsumer.beginMigration().get(30, TimeUnit.SECONDS);
-
-            // Interleave migration batches with heartbeats. Ensure the heartbeat events use the correct
-            // offset when adding to the purgatory. Otherwise, we get errors like:
-            //   There is already a deferred event with offset 292. We should not add one with an offset of 241 which is lower than that.
-            for (int i = 0; i < 100; i++) {
-                Uuid topicId = Uuid.randomUuid();
-                String topicName = "testBrokerHeartbeatDuringMigration" + i;
-                Future<?> migrationFuture = migrationConsumer.acceptBatch(
-                    Arrays.asList(
-                        new ApiMessageAndVersion(new TopicRecord().setTopicId(topicId).setName(topicName), (short) 0),
-                        new ApiMessageAndVersion(new PartitionRecord().setTopicId(topicId).setPartitionId(0).setIsr(Arrays.asList(0, 1, 2)), (short) 0)));
-                active.processBrokerHeartbeat(ANONYMOUS_CONTEXT, new BrokerHeartbeatRequestData().
-                        setWantFence(false).setBrokerEpoch(reply.epoch()).setBrokerId(0).
-                        setCurrentMetadataOffset(100000L + i));
-                migrationFuture.get();
-            }
-
-            // Ensure that we can complete a heartbeat even though we leave migration transaction hanging
-            assertEquals(new BrokerHeartbeatReply(true, false, false, false),
-                active.processBrokerHeartbeat(ANONYMOUS_CONTEXT, new BrokerHeartbeatRequestData().
-                    setWantFence(false).setBrokerEpoch(reply.epoch()).setBrokerId(0).
-                    setCurrentMetadataOffset(100100L)).get());
-
-        }
+                MetadataVersion.IBP_3_6_IV0,
+                3));
     }
 }

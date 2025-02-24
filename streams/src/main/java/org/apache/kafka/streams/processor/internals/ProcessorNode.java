@@ -99,7 +99,7 @@ public class ProcessorNode<KIn, VIn, KOut, VOut> {
         return children;
     }
 
-    ProcessorNode<KOut, VOut, ?, ?> getChild(final String childName) {
+    ProcessorNode<KOut, VOut, ?, ?> child(final String childName) {
         return childByName.get(childName);
     }
 
@@ -203,15 +203,20 @@ public class ProcessorNode<KIn, VIn, KOut, VOut> {
         } catch (final FailedProcessingException | TaskCorruptedException | TaskMigratedException e) {
             // Rethrow exceptions that should not be handled here
             throw e;
-        } catch (final RuntimeException processingException) {
+        } catch (final Exception processingException) {
+            // while Java distinguishes checked vs unchecked exceptions, other languages
+            // like Scala or Kotlin do not, and thus we need to catch `Exception`
+            // (instead of `RuntimeException`) to work well with those languages
             final ErrorHandlerContext errorHandlerContext = new DefaultErrorHandlerContext(
                 null, // only required to pass for DeserializationExceptionHandler
-                internalProcessorContext.topic(),
-                internalProcessorContext.partition(),
-                internalProcessorContext.offset(),
-                internalProcessorContext.headers(),
+                internalProcessorContext.recordContext().topic(),
+                internalProcessorContext.recordContext().partition(),
+                internalProcessorContext.recordContext().offset(),
+                internalProcessorContext.recordContext().headers(),
                 internalProcessorContext.currentNode().name(),
-                internalProcessorContext.taskId());
+                internalProcessorContext.taskId(),
+                internalProcessorContext.recordContext().timestamp()
+            );
 
             final ProcessingExceptionHandler.ProcessingHandlerResponse response;
             try {
@@ -219,13 +224,20 @@ public class ProcessorNode<KIn, VIn, KOut, VOut> {
                     processingExceptionHandler.handle(errorHandlerContext, record, processingException),
                     "Invalid ProductionExceptionHandler response."
                 );
-            } catch (final RuntimeException fatalUserException) {
+            } catch (final Exception fatalUserException) {
+                // while Java distinguishes checked vs unchecked exceptions, other languages
+                // like Scala or Kotlin do not, and thus we need to catch `Exception`
+                // (instead of `RuntimeException`) to work well with those languages
                 log.error(
                     "Processing error callback failed after processing error for record: {}",
                     errorHandlerContext,
                     processingException
                 );
-                throw new FailedProcessingException("Fatal user code error in processing error callback", fatalUserException);
+                throw new FailedProcessingException(
+                    "Fatal user code error in processing error callback",
+                    internalProcessorContext.currentNode().name(),
+                    fatalUserException
+                );
             }
 
             if (response == ProcessingExceptionHandler.ProcessingHandlerResponse.FAIL) {
@@ -233,7 +245,7 @@ public class ProcessorNode<KIn, VIn, KOut, VOut> {
                      " a processing error. If you would rather have the streaming pipeline" +
                      " continue after a processing error, please set the " +
                      PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG + " appropriately.");
-                throw new FailedProcessingException(processingException);
+                throw new FailedProcessingException(internalProcessorContext.currentNode().name(), processingException);
             } else {
                 droppedRecordsSensor.record();
             }

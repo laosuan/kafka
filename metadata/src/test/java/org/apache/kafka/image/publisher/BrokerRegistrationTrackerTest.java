@@ -55,7 +55,7 @@ public class BrokerRegistrationTrackerTest {
         MetadataImage image = MetadataImage.EMPTY;
 
         void onMetadataUpdate(MetadataDelta delta) {
-            MetadataProvenance provenance = new MetadataProvenance(0, 0, 0);
+            MetadataProvenance provenance = new MetadataProvenance(0, 0, 0, true);
             image = delta.apply(provenance);
             LogDeltaManifest manifest = new LogDeltaManifest.Builder().
                 provenance(provenance).
@@ -99,6 +99,9 @@ public class BrokerRegistrationTrackerTest {
             setBrokerId(1).
             setIncarnationId(INCARNATION_ID).
             setLogDirs(Arrays.asList(A, B, C)));
+        delta.replay(new FeatureLevelRecord().
+            setName(MetadataVersion.FEATURE_NAME).
+            setFeatureLevel(MetadataVersion.MINIMUM_VERSION.featureLevel()));
         ctx.onMetadataUpdate(delta);
         assertEquals(0, ctx.numCalls.get());
     }
@@ -133,8 +136,11 @@ public class BrokerRegistrationTrackerTest {
             setBrokerId(1).
             setIncarnationId(INCARNATION_ID).
             setLogDirs(Collections.emptyList()));
+        delta.replay(new FeatureLevelRecord().
+            setName(MetadataVersion.FEATURE_NAME).
+            setFeatureLevel(MetadataVersion.IBP_3_7_IV1.featureLevel()));
         ctx.onMetadataUpdate(delta);
-        // No calls are made because MetadataVersion is 3.0-IV1 initially
+        // No calls are made because MetadataVersion is older than IBP_3_7_IV2 initially
         assertEquals(0, ctx.numCalls.get());
 
         delta = ctx.newDelta();
